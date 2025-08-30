@@ -32,6 +32,48 @@ RUN python3 -m pip install --no-cache-dir --prefer-binary \
       --index-url https://pypi.org/simple \
       adafruit-circuitpython-pca9685 adafruit-blinka
 
+# gpiodツール & Pythonバインディング
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gpiod libgpiod2 python3-libgpiod \
+    && rm -rf /var/lib/apt/lists/*
+
+# Jetson.GPIO（JP6対応版を明示。Orin Nano/Superは 2.1.8+ が安全）
+RUN python3 -m pip install --no-cache-dir \
+      --index-url https://pypi.org/simple \
+      "Jetson.GPIO>=2.1.8"
+
+# controls / utils（前の提案どおり） batch A
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-evdev joystick htop tree vim git wget unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --index-url https://pypi.org/simple \
+      simple-pid pyyaml tqdm pyserial
+
+# GStreamer Python bindings（cv2だけなら不要） batch B
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-gi python3-gst-1.0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Adafruit/Jetson系は導入済みを前提（未導入ならここに追記） batch C
+# RUN python3 -m pip install --no-cache-dir --index-url https://pypi.org/simple \
+#       adafruit-circuitpython-pca9685 adafruit-blinka Jetson.GPIO>=2.1.8
+
+# JetRacer リポを入れる場合（とりあえず notebooks だけ持ってくる）
+# "FaBoPlatform/jetracer" を想定（必要に合わせて repo/branch を差し替え）
+RUN git clone https://github.com/FaBoPlatform/jetracer /opt/jetracer || true
+# 必要なnotebook/スクリプトだけコピー（全部は入れない）
+# 例:
+# RUN mkdir -p /workspace/notebooks/jetracer && \
+#     cp -r /opt/jetracer/notebooks/* /workspace/notebooks/jetracer/
+
+# --- Batch D: FaBo PCA9685 (import Fabo_PCA9685 を有効化)
+# 依存の smbus/smbus2 は既に入っている前提（入ってなければ python3-smbus をaptで）
+RUN python3 -m pip install --no-cache-dir \
+      --index-url https://pypi.org/simple \
+      "git+https://github.com/FaBoPlatform/FaBoPWM-PCA9685-Python@master#egg=Fabo_PCA9685"
+
+
 # 作業ディレクトリ
 WORKDIR /workspace
 
@@ -50,3 +92,4 @@ USER ${USERNAME}
 
 EXPOSE 8888
 CMD ["bash", "-lc", "jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='' --NotebookApp.password='' --allow-root"]
+

@@ -7,4 +7,4 @@ docker run --rm -it \
   -v $PWD/notebooks:/workspace/notebooks \
   -v $PWD/data:/workspace/data \
   -p 8888:8888 \
-  132fdd133060
+  jetracer62:latest
