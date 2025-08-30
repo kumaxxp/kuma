@@ -1,126 +1,234 @@
-# 目的
 
-* **Jetson Orin Nano Super + JetPack 6.2.1（L4T r36.4.x / CUDA 12.8）**で**JetRacer**を動かす。
-* **PyTorch/torchvision は dustynv ベースで稼働済み**。Notebook からの I2C/GPIO も動作確認済み。
+# JetRacer on Jetson Orin Nano Super (JetPack 6.2.1)
 
-# 採用ベース & 重要方針
+Jetson Orin Nano Super + **JetPack 6.2.1 (L4T r36.4.x / CUDA 12.8)** 上で、**PyTorch/torchvision** と **I2C (PCA9685)** / **GPIO** を Docker コンテナ内から扱うための環境です。
+ベースは `dustynv/pytorch` を採用し、**最小セットを段階追加**する方針で構成しています。
 
-* ベース: `dustynv/pytorch:2.7-r36.4.0`（fallback: `2.6-r36.4.0(-cu128)`）
-* **pip の index が Jetsonミラーに向く** → 重いもの（SciPy等）は **apt**、一般PyPIパッケージは `--index-url https://pypi.org/simple` 明示で最小導入。
-* **DeepStream/旧PyTorch wheel/virtualenv大量pinは混ぜない**（世代不一致で壊れる）。
-* 追加は**小さく分割（Batch A/B/C/D…）→毎回スモークテスト**。
+* ベース: `dustynv/pytorch:2.7-r36.4.0`（fallback: `dustynv/pytorch:2.6-r36.4.0-cu128`）
+* 実機確認: PyTorch/torchvision, GPIO, I2C(PCA9685) 動作済み
+* 既知: 主環境では **PCA9685 = `/dev/i2c-7`, 0x40** で認識
 
-# 現行 Dockerfile（抜粋 / 差分の中核）
+---
 
-```dockerfile
-FROM dustynv/pytorch:2.7-r36.4.0
-ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Tokyo \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 FORCE_COLOR=1
+## 0. ホスト前提（JetPack 6.x の注意）
 
-# 必須: I2C/カメラ/GUI最低限 + gpiod + OpenCV(apt)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-  python3-dev build-essential git cmake pkg-config \
-  libjpeg-dev libpng-dev libtiff-dev libavcodec-dev libavformat-dev libswscale-dev \
-  libgtk-3-dev libcanberra-gtk3-module libv4l-dev v4l-utils \
-  gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
-  libgl1-mesa-glx libglib2.0-0 \
-  i2c-tools python3-smbus python3-opencv \
-  gpiod libgpiod2 python3-libgpiod sudo curl ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
-
-# pip は本家PyPIから最小だけ
-RUN python3 -m pip install --no-cache-dir --index-url https://pypi.org/simple \
-  "Jetson.GPIO>=2.1.8" adafruit-circuitpython-pca9685 adafruit-blinka
-
-# FaBo PCA9685（Notebookが import Fabo_PCA9685 を要求）
-RUN python3 -m pip install --no-cache-dir --index-url https://pypi.org/simple \
-  "git+https://github.com/FaBoPlatform/FaBoPWM-PCA9685-Python@master#egg=Fabo_PCA9685"
-
-WORKDIR /workspace
-
-# 非rootユーザ（UID/GID=1000想定）
-ARG USERNAME=jetson UID=1000 GID=1000
-RUN groupadd -g ${GID} ${USERNAME} && useradd -m -s /bin/bash -u ${UID} -g ${GID} ${USERNAME} \
- && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/${USERNAME}
-USER ${USERNAME}
-
-EXPOSE 8888
-CMD ["bash","-lc","jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='' --NotebookApp.password='' --allow-root"]
-```
-
-# 既知の論点と解決
-
-* **scipy の pip 失敗**: ベースの pip index が NVIDIA 側を向くため。→ **削除** or 本当に要る時だけ `apt-get install python3-scipy`。
-* **GPIO**: JP6 は **libgpiod** 前提。→ `gpiod/python3-libgpiod/Jetson.GPIO>=2.1.8` を入れる＋ `/dev/gpiochip*` を渡す。
-* **I2C**: `/dev/i2c-*` を `--device` で渡し、`i2c` グループを `--group-add`。Bus 番号は `i2cdetect -l` で確認（有力: `1`, 次点 `9`）。
-
-# 起動テンプレ（まずは切り分け → その後絞る）
+JetPack 6.x は **Docker が自動導入されません**。未導入なら先にセットアップしてください。
 
 ```bash
-# 共有ノートブック
+sudo apt update
+sudo apt install -y nvidia-container curl
+curl -s https://get.docker.com | sh
+sudo systemctl --now enable docker
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+> 40pin の I2C/GPIO を使う場合は **Jetson-IO** で有効化 → 再起動
+> `sudo /opt/nvidia/jetson-io/jetson-io.py`
+
+---
+
+## 1. ビルド
+
+```bash
+# プロジェクト直下にある Dockerfile をビルド
+docker build -t jetracer-jp62:latest .
+```
+
+> `pip` で重い数値系を入れると壊れがちです。SciPy が必要なら **apt の `python3-scipy`** を使うなど、追加は小さく分けてください（後述）。
+
+---
+
+## 2. 起動
+
+### 2-1. 初回（切り分け用：とりあえず通す）
+
+まずは一度 **強め設定**で起動して、I2C/GPIO/入力デバイスが見えることを確認します。
+
+```bash
 HOST_NOTEBOOKS=/home/kuma/Public/fabo/jetracer/notebooks
 
-# まずは通す（切り分け）。通ったら --privileged を外し、--device を最小化。
 docker run --rm -it --privileged \
   --runtime nvidia --network host --ipc=host \
   $(for d in /dev/gpiochip* /dev/i2c-* /dev/input/js* /dev/input/event*; do [ -e "$d" ] && echo --device $d; done) \
   --group-add $(getent group gpio  | cut -d: -f3) \
   --group-add $(getent group i2c   | cut -d: -f3) \
   --group-add $(getent group input | cut -d: -f3) \
-  -v /tmp/.X11-unix:/tmp/.X11-unix -e DISPLAY=$DISPLAY \
+  -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v "$HOST_NOTEBOOKS":/workspace/notebooks:rw \
-  -p 8888:8888 yourimage:latest
+  -p 8888:8888 \
+  jetracer-jp62:latest
 ```
 
-# スモークテスト（Notebook/ターミナル）
+ブラウザから `http://<JetsonのIP>:8888` を開くと JupyterLab にアクセスできます。
+
+### 2-2. 以降（最小権限で運用）
+
+PCA9685 しか使わないなら、**I2C デバイスだけ**渡す運用に切り替えます。（実機で `/dev/i2c-7` だった例）
 
 ```bash
-# CUDA/torch/vision
-python3 - <<'PY'
-import torch, torchvision; print(torch.__version__, torch.cuda.is_available(), torchvision.__version__)
-PY
+docker run --rm -it \
+  --runtime nvidia --network host --ipc=host \
+  --device /dev/i2c-7 \
+  --group-add $(getent group i2c | cut -d: -f3) \
+  -v "$HOST_NOTEBOOKS":/workspace/notebooks:rw \
+  -p 8888:8888 \
+  jetracer-jp62:latest
+```
 
-# I2C
-i2cdetect -l
-i2cdetect -y 1     # 見つかったバスに合わせる
+必要に応じて `/dev/gpiochip*`、`/dev/input/*` を追加してください。
 
-# GPIO
-gpiodetect; gpioinfo | head
+---
+
+## 3. 動作確認（ノートブック / ターミナル）
+
+### 3-1. PyTorch/torchvision
+
+```bash
 python3 - <<'PY'
-import Jetson.GPIO as GPIO; print(GPIO.VERSION, GPIO.JETSON_INFO)
+import torch, torchvision
+print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'vision', torchvision.__version__)
 PY
 ```
 
-# PCA9685 動作チェック
+### 3-2. I2C（バス列挙 → スキャン）
 
-```python
-# FaBo
-import Fabo_PCA9685, pkg_resources
-import smbus2 as smbus   # or from smbus import SMBus
-bus = smbus.SMBus(1)     # 見つかったバスに合わせる
-pca = Fabo_PCA9685.PCA9685(bus, INITIAL_VALUE=300)
-pca.set_hz(50); pca.set_channel_value(0, 330); print("FaBo OK")
-
-# 代替: Adafruit
-from adafruit_pca9685 import PCA9685
-from board import SCL, SDA
-# Jetsonでは blinka 経由の I2C バス取得に追加設定が必要な場合あり。FaBoが通るならまずはFaBo継続でOK。
+```bash
+i2cdetect -l        # 例: i2c-7 ほか
+i2cdetect -y 7      # 実際のバス番号に置き換え
 ```
 
-# Batch 計画（状態）
+### 3-3. GPIO（libgpiod）
 
-* **Batch A（入力/ユーティリティ）**: `python3-evdev`/`joystick`/`pyyaml`/`simple-pid`/`tqdm`/`pyserial` など → **導入候補**（必要が出たら入れる）。
-* **Batch B（GStreamer Python）**: `python3-gi`/`python3-gst-1.0` → **ノートが Gst を使うなら追加**。
-* **Batch C（JetRacer最小移植）**: リポは必要部だけ持込（丸ごと導入は最後）。
-* **Batch D（FaBo PCA9685）**: **導入済み（上記 pip git+ URL）**。
+```bash
+gpiodetect
+gpioinfo | head
+python3 - <<'PY'
+import Jetson.GPIO as GPIO
+print('Jetson.GPIO', GPIO.VERSION, GPIO.JETSON_INFO)
+PY
+```
 
-# 旧Dockerfileから“持ち込まない”もの
+### 3-4. PCA9685（FaBo ライブラリ）
 
-* DeepStream 6.2 一式、torch/vision の手動 wheel、巨大 virtualenv/pin、GCC9固定/CMakeビルド、torch2trt、TF2.12、DonkeyCar… → **今は不採用**（世代不一致/肥大化/壊れやすい）。
+> 実機では **bus=7, addr=0x40** を確認済み。違う場合は下記の `BUS/ADDR` を修正。
 
-# 次の一手
+```bash
+python3 - <<'PY'
+try:
+    import smbus2 as smbus
+except ImportError:
+    from smbus import SMBus as smbus
+import Fabo_PCA9685
 
-1. 現行イメージで **Notebook実行→I2C(0x40)・GPIO・カメラ・推論**を再確認。
-2. Notebookが要求する欠品が出たら、**1〜2個ずつ**（Batch A/B/Cの方針で）Dockerfileに追記→再ビルド。
-3. `--privileged` を外し、実際に使う **`--device` と `--group-add` を最小化**。
+BUS, ADDR, INIT = 7, 0x40, 300     # ←環境に合わせて
+bus = smbus.SMBus(BUS)
+pca = Fabo_PCA9685.PCA9685(bus, INIT, ADDR)  # 位置引数！
+pca.set_hz(50)
+pca.set_channel_value(0, 330)      # CH0 を軽く動かす
+print("FaBo OK")
+PY
+```
+
+---
+
+## 4. ノートブックの共有
+
+ホストのノートブックディレクトリをコンテナの `/workspace/notebooks` にマウントしています。
+
+```bash
+-v /home/kuma/Public/fabo/jetracer/notebooks:/workspace/notebooks:rw
+```
+
+JupyterLab から `notebooks/` 以下が見えます。
+
+---
+
+## 5. 追加インストールの方針（小分け）
+
+**一気に入れない**のが安定の近道です。ImportError が出たら、\*\*そのパッケージ“だけ”\*\*を追加して再ビルド。
+
+* 入力デバイス（ゲームパッド）:
+
+  * apt: `python3-evdev joystick`
+  * run: `--device /dev/input/js0 --group-add $(getent group input | cut -d: -f3)`
+* GStreamer を Python から使う場合:
+
+  * apt: `python3-gi python3-gst-1.0`
+* 数値系（どうしても必要な時だけ）:
+
+  * **SciPy** は apt: `python3-scipy`（pip で入れない）
+* シリアル:
+
+  * pip: `pyserial`、run: `--device /dev/ttyUSB0` など
+
+> `dustynv/pytorch` のイメージは pip の index が NVIDIA/Jetson ミラーに向くため、**一般パッケージは本家PyPI**を明示して入れるのが安全です（Dockerfile では `--index-url https://pypi.org/simple` を付けています）。
+
+---
+
+## 6. よくあるエラーと対処
+
+* `No i2c-bus specified!`
+  → `i2cdetect -l` でバス番号を確認し、`i2cdetect -y <bus>` の形で実行。
+
+* `Permission denied: /dev/i2c-*`
+  → `--group-add $(getent group i2c | cut -d: -f3)` を付ける。切り分けに一度 `--privileged` でも可。
+
+* `ModuleNotFoundError: Jetson` / `This library is not supported on this board`
+  → `Jetson.GPIO>=2.1.8` を入れる（JP6 対応）。`/dev/gpiochip*` をコンテナに渡す。
+
+* `Fabo_PCA9685` の `TypeError: unexpected keyword argument 'INITIAL_VALUE'`
+  → **位置引数で渡す**（`PCA9685(bus, INIT[, ADDR])`）。キーワード引数は不可。
+
+* `i2cdetect` に 0x40 が出ない / `OSError: [Errno 121]`
+  → バスやアドレス（0x40〜0x47）違い、配線/電源、Jetson-IO 設定を再確認。
+
+---
+
+## 7. JetRacer への展開（最小ループ）
+
+1. **ステア/スロットルのパルス範囲**を実機でキャリブ
+2. **ゲームパッド**が必要なら `python3-evdev` + `/dev/input/*` を渡す
+3. **カメラ**はまず `cv2.VideoCapture` / `gst-launch-1.0` で生存確認
+   （必要時のみ `python3-gi` を導入）
+
+> JetRacer のリポは丸ごと入れず、**Notebook/スクリプトの必要部分だけ**段階的に持ち込むのが安全です。
+
+---
+
+## 8. メンテ
+
+* ベースタグ更新（例：`2.7-r36.4.0` → 次の r36.x）時は、まず **pip 追加を最小**にしてビルド通し → 検証後に必要分だけ追加。
+* 依存追加は **1〜2個ずつ** → スモークテスト → コミット、のリズムで。
+
+---
+
+## 9. ライセンス / 謝辞
+
+* ベースイメージ: [dustynv/pytorch](https://hub.docker.com/r/dustynv/pytorch)
+* FaBo PCA9685: FaBoPlatform/FaBoPWM-PCA9685-Python
+* その他 OSS に感謝
+
+---
+
+## 付録：トラブルシュート用スクリプト（オプション）
+
+**存在する I2C/GPIO/Input デバイスだけ**を自動で渡して起動するワンライナー。
+
+```bash
+HOST_NOTEBOOKS=/home/kuma/Public/fabo/jetracer/notebooks
+ARGS=""
+for d in /dev/gpiochip* /dev/i2c-* /dev/input/js* /dev/input/event*; do
+  [ -e "$d" ] && ARGS="$ARGS --device $d"
+done
+docker run --rm -it --privileged \
+  --runtime nvidia --network host --ipc=host \
+  $ARGS \
+  --group-add $(getent group gpio  | cut -d: -f3) \
+  --group-add $(getent group i2c   | cut -d: -f3) \
+  --group-add $(getent group input | cut -d: -f3) \
+  -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v "$HOST_NOTEBOOKS":/workspace/notebooks:rw \
+  -p 8888:8888 jetracer-jp62:latest
+```
 
