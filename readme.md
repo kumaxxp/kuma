@@ -232,3 +232,217 @@ docker run --rm -it --privileged \
   -p 8888:8888 jetracer-jp62:latest
 ```
 
+
+# Jetson Orin Nano: 基本設定・動作確認・トラブル対策
+
+## 0. 前提
+
+* JetPack **6.2.1**（L4T **r36.4**）をフラッシュ済み
+* CSI カメラ（例: **IMX219**）を **CAM0/CAM1** に接続
+* Docker で `jetracer62:latest` を使用
+
+> JP6 では **CSI は Argus 経由**で扱うのが基本。`/dev/video*` を直接 `cv2.VideoCapture(0)` で触る構成は非推奨。
+> コンテナからは **`/tmp/argus_socket` をマウント**して GStreamer/JetCam で読ませる。
+
+---
+
+## 1) ホスト側の初期設定（1回だけ）
+
+### 1-1. Jetson-IO でカメラを有効化
+
+```bash
+sudo /opt/nvidia/jetson-io/jetson-io.py
+# 「Configure for compatible hardware」→ 使っているセンサを CAM0 / CAM1（Dual 構成）で選択
+# Save → Reboot
+```
+
+### 1-2. 基本ツール
+
+```bash
+sudo apt-get update
+sudo apt-get install -y v4l-utils gstreamer1.0-tools
+```
+
+---
+
+## 2) ホスト側 動作確認（再起動ごとにOK）
+
+```bash
+# Argus を整える
+sudo systemctl restart nvargus-daemon
+systemctl is-active nvargus-daemon   # active ならOK
+
+# デバイス列挙（/dev/media0 が鍵）
+v4l2-ctl --list-devices
+
+# メディアグラフにセンサ名が出るか（imx219 / imx477 等）
+media-ctl -p -d /dev/media0 | sed -n '1,200p'
+
+# 実取り出し（表示なしテスト）
+gst-launch-1.0 -q -e nvarguscamerasrc sensor-id=0 \
+ ! 'video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1' \
+ ! nvvidconv ! fakesink
+
+gst-launch-1.0 -q -e nvarguscamerasrc sensor-id=1 \
+ ! 'video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1' \
+ ! nvvidconv ! fakesink
+```
+
+**OKの目安**
+
+* `v4l2-ctl` に `/dev/media0` が出る
+* `media-ctl -p` に `imx219 ...` が **2本**並ぶ
+* `gst-launch` が sensor-id=0/1 ともに終了できる
+
+---
+
+## 3) コンテナ起動（ヘッドレス安定版・推奨）
+
+> DISPLAY は渡さず **EGL をサーフェスレス**で初期化する。
+> CSI は **Argus ソケット**を渡す。
+
+```bash
+ARGS=""
+# I2C
+for d in /dev/i2c-*; do [ -e "$d" ] && ARGS="$ARGS --device $d"; done
+# GPU/EGL 必須ノード
+for d in /dev/nvhost-ctrl /dev/nvhost-ctrl-gpu /dev/nvhost-prof-gpu \
+         /dev/nvhost-gpu /dev/nvhost-as-gpu /dev/nvhost-vic /dev/nvmap; do
+  [ -e "$d" ] && ARGS="$ARGS --device $d"
+done
+# DRM（EGLが裏で触る）
+for d in /dev/dri/card* /dev/dri/renderD*; do
+  [ -e "$d" ] && ARGS="$ARGS --device $d"
+done
+
+docker run --rm -it \
+  --runtime nvidia --network host --ipc=host \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e EGL_PLATFORM=surfaceless \
+  -e DISPLAY= \                               # ← DISPLAY を明示的に空
+  -v /tmp/argus_socket:/tmp/argus_socket \    # ← ★必須
+  --group-add $(getent group video | cut -d: -f3) \
+  --group-add $(getent group i2c   | cut -d: -f3) \
+  $ARGS \
+  -v /home/kuma/Public/fabo/jetracer/notebooks:/workspace/notebooks:rw \
+  -v "$PWD/data":/workspace/data \
+  -p 8888:8888 \
+  --name jetracer-jp62 \
+  jetracer62:latest
+```
+
+> **X で表示したい場合**は `-e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v $HOME/.Xauthority:/root/.Xauthority:ro` を付け、ホストで `xhost +si:localuser:root` を実行。ただしまずはヘッドレスで安定させるのが無難。
+
+---
+
+## 4) コンテナ内のテスト
+
+### 4-1. GStreamer（表示なし）
+
+```bash
+gst-launch-1.0 -q -e nvarguscamerasrc sensor-id=0 \
+ ! 'video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1' \
+ ! nvvidconv ! fakesink
+```
+
+### 4-2. JetCam（Python）
+
+```python
+from jetcam.csi_camera import CSICamera
+
+cam = CSICamera(sensor_id=0, width=1280, height=720, capture_fps=30)
+frame = cam.read()
+print(frame.shape)  # 例: (720, 1280, 3)
+
+# クローズ（CSICamera自体には release() は無い）
+cam.running = False
+cam.cap.release()
+```
+
+> OpenCV 警告 `Cannot query video position` はライブソースの仕様。無視でOK。
+
+### 4-3. I²C
+
+```bash
+i2cdetect -l
+i2cdetect -y 1     # バスは環境に合わせる（ホストの `i2cdetect -l` と一致させる）
+```
+
+---
+
+## 5) Dockerfile 側の前提（要点だけ）
+
+* **OpenCV は apt の `python3-opencv` を使う**（GStreamer有効）
+* \*\*NumPy は apt の `python3-numpy`（1.x）\*\*で固定
+
+  * pip で `numpy` を入れない／入れるなら **`numpy<2`** にピン
+* **JetCam はソースから `--no-deps`** で入れる（pip の OpenCV を引っ張らない）
+
+例（抜粋）:
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-opencv python3-numpy \
+    v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    python3-gi python3-gst-1.0 git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/NVIDIA-AI-IOT/jetcam.git /opt/jetcam && \
+    cd /opt/jetcam && python3 -m pip install --no-deps -e .
+```
+
+（Jupyter は `ipykernel` をインストール＆登録、起動時に runtime/workspace を掃除）
+
+---
+
+## 6) よくあるトラブルと対策（最速版）
+
+| 症状/ログ                                                                                   | 典型原因                                | 対策                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `No cameras available`                                                                  | Jetson-IO未設定 / 配線 / Argus未起動        | Jetson-IOでセンサ(Dual)を選び直し→再起動。`sudo systemctl restart nvargus-daemon`。`media-ctl -p` にセンサが出るか確認。                                                                                           |
+| `EGL failed to initialize` / `nvbufsurftransform: Could not get EGL display connection` | GPU/EGLデバイスをコンテナに渡してない / DISPLAYが悪さ | `/dev/nvhost-*` `/dev/nvmap` `/dev/dri/*` を `--device` で付与。ヘッドレスなら **`-e DISPLAY=`** と **`EGL_PLATFORM=surfaceless`**。                                                                    |
+| Jupyter `Kernel does not exist` 404                                                     | 古い kernel\_id を参照                   | `rm -rf ~/.local/share/jupyter/runtime/* ~/.cache/jupyter/lab/workspaces/*`、`python3 -m ipykernel install --name python3 --display-name "Python 3 (JP6)" --sys-prefix`、`/lab?reset` で再入場。 |
+| `ImportError: numpy.core.multiarray failed to import` / NumPy 2.x 警告                    | pip で NumPy 2.x を入れて ABI 崩壊         | コンテナで `pip uninstall -y numpy` → `apt install -y python3-numpy`（もしくは `pip install "numpy<2"`）。**pip の opencv-python は禁止**。                                                                |
+| `CSICamera` の後片付けで例外                                                                    | `camera.release()` を呼んでいる           | `camera.cap.release()` に変更し、必要なら `camera.running=False` も。                                                                                                                                |
+| `i2cdetect: No i2c-bus specified`                                                       | バス番号ミス                              | まず `i2cdetect -l` で一覧→ `-y <bus>` を指定。コンテナに \**/dev/i2c-* を渡す\*\*こと。                                                                                                                      |
+| `Permission denied: lsmod/modprobe`                                                     | 非特権でモジュール操作                         | 無視でOK。今回の用途に不要。                                                                                                                                                                           |
+
+---
+
+## 7) ワンコマンド健診スクリプト（ホスト）
+
+```bash
+cat <<'SH' > cam_health.sh
+#!/usr/bin/env bash
+set -euo pipefail
+sudo systemctl restart nvargus-daemon
+sleep 1
+echo "=== Argus ==="; systemctl is-active nvargus-daemon
+echo "=== v4l2-ctl ==="; v4l2-ctl --list-devices || true
+echo "=== media-ctl (/dev/media0) ==="; media-ctl -p -d /dev/media0 | sed -n '1,120p' || true
+for sid in 0 1; do
+  echo "=== gst sensor-id=$sid ==="
+  gst-launch-1.0 -q -e nvarguscamerasrc sensor-id=$sid \
+   ! 'video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1' \
+   ! nvvidconv ! fakesink || true
+done
+SH
+chmod +x cam_health.sh
+```
+
+---
+
+## 8) 参考：OpenCV からの正しい読み方（GStreamer）
+
+```python
+import cv2
+def open_cam(sensor_id=0, w=1280, h=720, fps=30):
+    pipe=(f"nvarguscamerasrc sensor-id={sensor_id} ! "
+          f"video/x-raw(memory:NVMM),width={w},height={h},framerate={fps}/1 ! "
+          "nvvidconv ! video/x-raw,format=BGRx ! "
+          "videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1")
+    return cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
+
+cap=open_cam(0); ok,frame=cap.read(); print(ok, frame.shape if ok else None); cap.release()
+```
+
