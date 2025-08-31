@@ -1,5 +1,18 @@
+#ARGS=""
+#for d in /dev/i2c-* /dev/gpiochip*; do [ -e "$d" ] && ARGS="$ARGS --device $d"; done
+
 ARGS=""
-for d in /dev/i2c-* /dev/gpiochip*; do [ -e "$d" ] && ARGS="$ARGS --device $d"; done
+# I2C
+for d in /dev/i2c-*; do [ -e "$d" ] && ARGS="$ARGS --device $d"; done
+# GPU/EGL に必要
+for d in /dev/nvhost-ctrl /dev/nvhost-ctrl-gpu /dev/nvhost-prof-gpu \
+         /dev/nvhost-gpu /dev/nvhost-as-gpu /dev/nvmap; do
+  [ -e "$d" ] && ARGS="$ARGS --device $d"
+done
+# DRM（EGL が裏で触ることがある）
+for d in /dev/dri/card* /dev/dri/renderD*; do
+  [ -e "$d" ] && ARGS="$ARGS --device $d"
+done
 
 docker run --rm -it \
   --privileged \
