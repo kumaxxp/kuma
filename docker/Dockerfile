@@ -74,6 +74,28 @@ RUN python3 -m pip install --no-cache-dir \
       "git+https://github.com/FaBoPlatform/FaBoPWM-PCA9685-Python@master#egg=Fabo_PCA9685"
 
 
+# --- JetCam (CSI camera) support on JP6 (Python3.10/aarch64) ---
+# OpenCVはaptのビルド済みを使う（pipのopencv-pythonは使わない）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-opencv \
+    v4l-utils \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    python3-gi python3-gst-1.0 \
+    git && \
+    rm -rf /var/lib/apt/lists/*
+
+# pipのインデックスを本家PyPIに向け、軽い純Python依存だけ入れる
+ENV PIP_INDEX_URL=https://pypi.org/simple
+RUN python3 -m pip install --no-cache-dir -U pip traitlets numpy
+
+# JetCam をソースから（OpenCV依存はaptで満たすため --no-deps）
+RUN git clone --depth 1 https://github.com/NVIDIA-AI-IOT/jetcam.git /opt/jetcam && \
+    cd /opt/jetcam && \
+    python3 -m pip install --no-deps -e .
+      
+
 # 作業ディレクトリ
 WORKDIR /workspace
 
