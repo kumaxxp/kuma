@@ -446,3 +446,158 @@ def open_cam(sensor_id=0, w=1280, h=720, fps=30):
 cap=open_cam(0); ok,frame=cap.read(); print(ok, frame.shape if ok else None); cap.release()
 ```
 
+## Notebook を動かすための追加手順（Lab4 対応版）
+
+### 1) クリック可能画像ウィジェット（Lab4互換）
+
+JupyterLab 4 では従来の `jupyter_clickable_image_widget` がフロント非対応。**互換ラッパー**を使います。
+
+* すでに Dockerfile で `ipyevents` を入れてあること（未導入なら `pip install ipyevents`）。
+* ノートブックと同じディレクトリに **`jupyter_clickable_image_widget.py`** を作成して、下記をそのまま保存。
+
+```python
+# jupyter_clickable_image_widget.py
+from ipywidgets import Image, VBox, Layout
+from ipyevents import Event
+
+class ClickableImageWidget(VBox):
+    """
+    互換ラッパー：
+      - .value に JPEG bytes を代入して表示（従来通り）
+      - .on_msg(handler) で {'event','x','y','width','height'} を通知（従来通りのシグネチャ）
+    """
+    def __init__(self, width=640, height=480):
+        self._w = int(width); self._h = int(height)
+        self.image = Image(format='jpeg', layout=Layout(width=f"{self._w}px", height=f"{self._h}px"))
+        super().__init__([self.image])
+        self._handlers = []
+        self._ev = Event(source=self.image, watched_events=['click'])
+        self._ev.on_dom_event(self._on_click)
+
+    def _on_click(self, e: dict):
+        x = int(e.get('relativeX', e.get('offsetX', 0)))
+        y = int(e.get('relativeY', e.get('offsetY', 0)))
+        msg = {'event':'click','x':x,'y':y,'width':self._w,'height':self._h}
+        for h in list(self._handlers): h(self, msg)
+
+    def on_msg(self, handler): self._handlers.append(handler)
+
+    @property
+    def value(self) -> bytes: return self.image.value
+    @value.setter
+    def value(self, data: bytes): self.image.value = data
+```
+
+> 既存ノートの `from jupyter_clickable_image_widget import ClickableImageWidget` を**そのまま**使えます。
+> **必ずカーネルを再起動**してから実行（古い拡張を掴んでいるとエラーが残ります）。
+
+---
+
+### 2) ノートブックのマウントと起動
+
+ホスト側のノートブックを `/workspace/notebooks` にマウントして起動します。I2C は **`/dev/i2c-7`**（あなたの環境）を最小権限で渡す。
+
+```bash
+HOST_NOTEBOOKS=/home/kuma/Public/fabo/jetracer/notebooks
+
+docker run --rm -it \
+  --runtime nvidia --network host --ipc=host \
+  --device /dev/i2c-7 \
+  --group-add $(getent group i2c | cut -d: -f3) \
+  -v "$HOST_NOTEBOOKS":/workspace/notebooks:rw \
+  -p 8888:8888 \
+  jetracer-jp62:latest
+```
+
+> ゲームパッドを使う場合は `--device /dev/input/js0 --group-add $(getent group input | cut -d: -f3)` を追加。
+> GPIO を使う場合は `--device /dev/gpiochip0 --group-add $(getent group gpio | cut -d: -f3)` などを追加。
+
+---
+
+### 3) 最初のセル（推奨：キャッシュ先の可視化＆確認）
+
+Dockerfileで `/data` 配下にキャッシュするよう設定済み。念のため Notebook 冒頭で確認・整備。
+
+```python
+import os, pathlib, torch
+print("TORCH_HOME =", os.environ.get("TORCH_HOME"))
+pathlib.Path(os.environ.get("TORCH_HOME","/data/torch")).mkdir(parents=True, exist_ok=True)
+torch.hub.set_dir(os.path.join(os.environ.get("TORCH_HOME","/data/torch"), "hub"))
+```
+
+---
+
+### 4) クリックウィジェットの簡易テスト
+
+（ノートが重いときはまずこれで表示とクリック取得だけ確認）
+
+```python
+from jupyter_clickable_image_widget import ClickableImageWidget
+from IPython.display import display
+
+w = ClickableImageWidget(320, 240)
+w.value = b"\xff\xd8\xff\xdb" + b"\x00"*100  # 仮のJPEG; 実際は bgr8_to_jpeg(frame) を入れる
+
+def on_click(widget, content):
+    print("clicked:", content)
+w.on_msg(on_click)
+display(w)
+```
+
+---
+
+### 5) JetRacer周辺のスモーク（必要に応じて）
+
+* **I2C / PCA9685**：`/dev/i2c-7` で 0x40 を使用。
+  ノート内テスト例：
+
+```python
+try:
+    import smbus2 as smbus
+except ImportError:
+    from smbus import SMBus as smbus
+import Fabo_PCA9685 as F
+
+bus = smbus.SMBus(7); pca = F.PCA9685(bus, 300, 0x40)
+pca.set_hz(50); pca.set_channel_value(0, 330)
+print("PCA9685 OK")
+```
+
+* **torchvision の学習済み重みDL**（権限OKの確認）：
+
+```python
+from torchvision.models import resnet18, ResNet18_Weights
+m = resnet18(weights=ResNet18_Weights.DEFAULT)
+print("weights cached to:", os.environ.get("TORCH_HOME"))
+```
+
+* **カメラ（CSI/USB）**：まず `cv2.VideoCapture(0)` で生存確認、または GStreamer パイプラインで確認。
+
+  * CSI 例（NV12→BGR）：`cv2.VideoCapture("nvarguscamerasrc ! video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1,format=NV12 ! nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! appsink", cv2.CAP_GSTREAMER)`
+
+---
+
+### 6) よくあるエラーと対処（Notebook版）
+
+* **Failed to load model class 'ClickableImageModel'**
+  → 上の **互換ラッパー `jupyter_clickable_image_widget.py` を置く**。置いた後は **カーネル再起動**。
+
+* **PermissionError: '/data/torch'**
+  → イメージに `/data` の作成と chown を入れている前提。念のためコンテナ内で
+  `ls -ld /data /data/torch` を確認。`jetson:jetson`（UID/GID=1000）で書けること。
+
+* **ModuleNotFoundError: matplotlib / jetcam**
+  → イメージに導入済み。もし古いイメージを使っているなら再ビルド。
+
+* **i2c が見えない / Permission denied**
+  → 起動コマンドに `--device /dev/i2c-7` と `--group-add $(getent group i2c | cut -d: -f3)` を付与。
+  Jetson-IO で I2C を有効化し、`i2cdetect -y 7` で 0x40 を確認。
+
+---
+
+### 7) 運用メモ（推奨）
+
+* 追加依存は **ImportError が出たタイミングで“最小1〜2個ずつ”** Dockerfile に追記→再ビルド。
+* `--privileged` は使わない。実際に使う `/dev/*` と `--group-add` のみに絞る。
+* PCA9685 のバス/アドレス（**bus=7 / addr=0x40**）は README に明記し、他環境に移す時のハマりを予防。
+
